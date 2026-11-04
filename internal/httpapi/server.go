@@ -1,29 +1,45 @@
 package httpapi
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
 	"mime"
-	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/bcrypt"
 
 	"listingboard/internal/board"
 )
 
-const sessionCookie = "lb_session"
+const (
+	sessionCookie = "lb_session"
+
+	// maxBrochure is the largest brochure the API accepts, in bytes.
+	maxBrochure = 1 << 20
+	pdfMagic    = "%PDF-"
+)
 
 type Server struct {
 	store   board.Store
 	dataDir string
 	webDir  string
 	handler http.Handler
+
+	// mu serialises the requests that change a sheet's state (upload and
+	// start), so "one brochure per sheet" and "one running sheet per account"
+	// hold when two requests arrive together. The worker never takes it: it
+	// only writes sheets that are already running, which these requests never
+	// modify.
+	mu sync.Mutex
 }
 
 type account struct {
@@ -201,10 +217,11 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.current(w, r); !ok {
+	user, ok := s.current(w, r)
+	if !ok {
 		return
 	}
-	job, ok := s.load(w, r)
+	job, ok := s.load(w, r, user)
 	if !ok {
 		return
 	}
@@ -212,61 +229,63 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.current(w, r); !ok {
-		return
-	}
-	job, ok := s.load(w, r)
+	user, ok := s.current(w, r)
 	if !ok {
 		return
 	}
-	if err := r.ParseMultipartForm(8 << 20); err != nil {
-		writeErr(w, http.StatusBadRequest, "Brochure upload was incomplete")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.load(w, r, user)
+	if !ok {
 		return
 	}
-	file, header, err := r.FormFile("file")
+	if job.Filename != "" {
+		writeErr(w, http.StatusBadRequest, "This sheet already has a brochure")
+		return
+	}
+	// The cap leaves room for the multipart framing around a file of exactly
+	// maxBrochure bytes. Nothing is buffered to disk: the part is read from the
+	// stream and only written under dataDir once it has been accepted.
+	r.Body = http.MaxBytesReader(w, r.Body, maxBrochure+64<<10)
+	name, data, err := readUpload(r)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "Choose a brochure file")
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	defer file.Close()
-	name := filenameFromHeader(header)
-	if strings.TrimSpace(name) == "" || !headerAllows(name, header.Header.Get("Content-Type")) {
+	if !validBrochure(data) {
 		writeErr(w, http.StatusBadRequest, "Brochure must be a PDF or a text file")
 		return
 	}
-	data, err := io.ReadAll(io.LimitReader(file, 8<<20+1))
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "Brochure upload was incomplete")
-		return
-	}
-	if len(data) > 8<<20 {
-		writeErr(w, http.StatusBadRequest, "Brochure is too large")
-		return
-	}
-	dir := filepath.Join(s.dataDir, job.ID)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	dst := board.BrochurePath(s.dataDir, job.UserID, job.ID)
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not store the brochure")
 		return
 	}
-	dst := filepath.Join(dir, name)
 	if err := os.WriteFile(dst, data, 0o644); err != nil {
+		_ = os.Remove(dst)
 		writeErr(w, http.StatusInternalServerError, "Could not store the brochure")
 		return
 	}
 	job.Filename = name
 	job.UpdatedAt = time.Now().UTC()
 	if err := s.store.UpdateJob(r.Context(), job); err != nil {
+		_ = os.Remove(dst)
 		writeErr(w, http.StatusInternalServerError, "Could not store the brochure")
 		return
 	}
 	writeJSON(w, http.StatusOK, job)
 }
 
+// start only hands a draft over to the worker: it becomes running with a fresh
+// runId and every step still pending. Finishing the sheet is the worker's job.
 func (s *Server) start(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.current(w, r); !ok {
+	user, ok := s.current(w, r)
+	if !ok {
 		return
 	}
-	job, ok := s.load(w, r)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.load(w, r, user)
 	if !ok {
 		return
 	}
@@ -274,14 +293,35 @@ func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "Attach a brochure first")
 		return
 	}
-	job.Status = "success"
+	if job.Status != "draft" {
+		// running keeps its runId, success and failed stay as they are.
+		writeJSON(w, http.StatusOK, job)
+		return
+	}
+	jobs, err := s.store.ListJobs(r.Context(), user.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "Could not start the sheet")
+		return
+	}
+	for _, other := range jobs {
+		if other.ID != job.ID && other.Status == "running" {
+			writeErr(w, http.StatusConflict, "Another sheet is already running")
+			return
+		}
+	}
+	job.Status = "running"
 	job.RunID = board.NewID()
 	job.Error = ""
 	for i := range job.Checklist {
-		job.Checklist[i].State = "done"
+		job.Checklist[i].State = "pending"
 	}
 	job.UpdatedAt = time.Now().UTC()
-	if err := s.store.UpdateJob(r.Context(), job); err != nil {
+	err = s.store.UpdateJob(r.Context(), job)
+	if errors.Is(err, board.ErrDuplicate) {
+		writeErr(w, http.StatusConflict, "Another sheet is already running")
+		return
+	}
+	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not start the sheet")
 		return
 	}
@@ -289,10 +329,11 @@ func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) download(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.current(w, r); !ok {
+	user, ok := s.current(w, r)
+	if !ok {
 		return
 	}
-	job, ok := s.load(w, r)
+	job, ok := s.load(w, r, user)
 	if !ok {
 		return
 	}
@@ -300,19 +341,35 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "Not found")
 		return
 	}
-	f, err := os.Open(filepath.Join(s.dataDir, job.ID, job.Filename))
+	f, err := os.Open(board.BrochurePath(s.dataDir, job.UserID, job.ID))
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "Not found")
 		return
 	}
 	defer f.Close()
-	w.Header().Set("Content-Disposition", "attachment; filename="+strconvQuote(filepath.Base(job.Filename)))
-	http.ServeContent(w, r, filepath.Base(job.Filename), job.UpdatedAt, f)
+	head := make([]byte, len(pdfMagic))
+	n, _ := io.ReadFull(f, head)
+	contentType := "text/plain; charset=utf-8"
+	if bytes.HasPrefix(head[:n], []byte(pdfMagic)) {
+		contentType = "application/pdf"
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		writeErr(w, http.StatusInternalServerError, "Could not read the brochure")
+		return
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if disposition := mime.FormatMediaType("attachment", map[string]string{"filename": downloadName(job.Filename)}); disposition != "" {
+		w.Header().Set("Content-Disposition", disposition)
+	}
+	http.ServeContent(w, r, "", job.UpdatedAt, f)
 }
 
-func (s *Server) load(w http.ResponseWriter, r *http.Request) (board.Job, bool) {
+// load returns the sheet named in the URL if it belongs to user. A sheet that
+// belongs to someone else is reported exactly like one that does not exist.
+func (s *Server) load(w http.ResponseWriter, r *http.Request, user board.User) (board.Job, bool) {
 	job, err := s.store.Job(r.Context(), r.PathValue("id"))
-	if errors.Is(err, board.ErrNotFound) {
+	if errors.Is(err, board.ErrNotFound) || (err == nil && job.UserID != user.ID) {
 		writeErr(w, http.StatusNotFound, "Not found")
 		return board.Job{}, false
 	}
@@ -353,23 +410,87 @@ func (s *Server) openSession(w http.ResponseWriter, r *http.Request, user board.
 	return nil
 }
 
-func filenameFromHeader(header *multipart.FileHeader) string {
-	_, params, err := mime.ParseMediaType(header.Header.Get("Content-Disposition"))
-	if err == nil {
+// readUpload streams the multipart field "file" out of the request. It returns
+// the filename the client sent (kept only as metadata, never used as a path)
+// and the bytes. Anything over maxBrochure is rejected before it is stored.
+func readUpload(r *http.Request) (string, []byte, error) {
+	incomplete := errors.New("Brochure upload was incomplete")
+	tooLarge := errors.New("Brochure is too large")
+	reader, err := r.MultipartReader()
+	if err != nil {
+		return "", nil, incomplete
+	}
+	for {
+		part, err := reader.NextPart()
+		if err == io.EOF {
+			return "", nil, errors.New("Choose a brochure file")
+		}
+		if err != nil {
+			return "", nil, uploadFailure(err, incomplete, tooLarge)
+		}
+		if part.FormName() != "file" {
+			continue
+		}
+		data, err := io.ReadAll(io.LimitReader(part, maxBrochure+1))
+		if err != nil {
+			return "", nil, uploadFailure(err, incomplete, tooLarge)
+		}
+		if len(data) > maxBrochure {
+			return "", nil, tooLarge
+		}
+		return originalName(part.Header.Get("Content-Disposition")), data, nil
+	}
+}
+
+func uploadFailure(err, incomplete, tooLarge error) error {
+	var limit *http.MaxBytesError
+	if errors.As(err, &limit) {
+		return tooLarge
+	}
+	return incomplete
+}
+
+// originalName is the filename parameter exactly as the client sent it. Go's
+// own Part.FileName would strip directories, but the spec keeps the original.
+func originalName(disposition string) string {
+	if _, params, err := mime.ParseMediaType(disposition); err == nil {
 		if name := strings.TrimSpace(params["filename"]); name != "" {
 			return name
 		}
 	}
-	return header.Filename
+	return "brochure"
 }
 
-func headerAllows(name, contentType string) bool {
-	ct := strings.ToLower(contentType)
-	lower := strings.ToLower(name)
-	if strings.Contains(ct, "pdf") || strings.Contains(ct, "text/plain") {
+// validBrochure decides the type from the bytes alone: a PDF starts with
+// "%PDF-", text is non-empty valid UTF-8 without NUL bytes. Everything else,
+// an empty file included, is rejected.
+func validBrochure(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	if bytes.HasPrefix(data, []byte(pdfMagic)) {
 		return true
 	}
-	return strings.HasSuffix(lower, ".pdf") || strings.HasSuffix(lower, ".txt")
+	return utf8.Valid(data) && bytes.IndexByte(data, 0) < 0
+}
+
+// downloadName is the client's filename reduced to a safe last path element for
+// the Content-Disposition header.
+func downloadName(name string) string {
+	if i := strings.LastIndexAny(name, `/\`); i >= 0 {
+		name = name[i+1:]
+	}
+	name = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return '_'
+		}
+		return r
+	}, name)
+	name = strings.TrimSpace(name)
+	if name == "" || name == "." || name == ".." {
+		return "brochure"
+	}
+	return name
 }
 
 func decode(w http.ResponseWriter, r *http.Request, dst any) error {
@@ -385,11 +506,6 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 
 func writeErr(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
-}
-
-func strconvQuote(value string) string {
-	b, _ := json.Marshal(value)
-	return string(b)
 }
 
 func withCORS(next http.Handler) http.Handler {

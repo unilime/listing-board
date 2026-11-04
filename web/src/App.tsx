@@ -29,8 +29,18 @@ export function App() {
   const [me, setMe] = useState<Account | null>(null);
   const [ready, setReady] = useState(false);
   const [jobs, setJobs] = useState<Job[]>([]);
-  const [selected, setSelected] = useState<Job | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [error, setError] = useState("");
+  const selected = jobs.find((job) => job.id === selectedId) ?? null;
+  const anyRunning = jobs.some((job) => job.status === "running");
+
+  function upsert(job: Job) {
+    setJobs((current) =>
+      current.some((item) => item.id === job.id)
+        ? current.map((item) => (item.id === job.id ? job : item))
+        : [job, ...current],
+    );
+  }
 
   useEffect(() => {
     api<Account>("/api/me")
@@ -48,6 +58,20 @@ export function App() {
       .then(setJobs)
       .catch((err: Error) => setError(err.message));
   }, [me]);
+
+  // The worker moves a running sheet along on its own, so keep asking the API
+  // until nothing is running any more. No reload is needed to see the checklist move.
+  useEffect(() => {
+    if (!me || !anyRunning) {
+      return;
+    }
+    const timer = setInterval(() => {
+      api<Job[]>("/api/jobs")
+        .then(setJobs)
+        .catch(() => undefined);
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [me, anyRunning]);
 
   if (!ready) {
     return <p className="muted">Loading…</p>;
@@ -68,7 +92,7 @@ export function App() {
           onClick={() => {
             api("/api/logout", { method: "POST" }).finally(() => {
               setMe(null);
-              setSelected(null);
+              setSelectedId(null);
             });
           }}
         >
@@ -78,8 +102,8 @@ export function App() {
       {error ? <p className="error">{error}</p> : null}
       <Create
         onCreated={(job) => {
-          setJobs((current) => [job, ...current]);
-          setSelected(job);
+          upsert(job);
+          setSelectedId(job.id);
           setError("");
         }}
         onError={setError}
@@ -89,7 +113,7 @@ export function App() {
           {jobs.length === 0 ? <li className="muted">No sheets yet.</li> : null}
           {jobs.map((job) => (
             <li key={job.id}>
-              <button className={selected?.id === job.id ? "row on" : "row"} onClick={() => setSelected(job)}>
+              <button className={selected?.id === job.id ? "row on" : "row"} onClick={() => setSelectedId(job.id)}>
                 <span>
                   <strong>{job.title}</strong>
                   <span className="muted">{job.address}</span>
@@ -102,10 +126,7 @@ export function App() {
         {selected ? (
           <Sheet
             job={selected}
-            onChange={(job) => {
-              setSelected(job);
-              setJobs((current) => current.map((item) => (item.id === job.id ? job : item)));
-            }}
+            onChange={upsert}
             onError={setError}
           />
         ) : (
@@ -160,6 +181,24 @@ function Auth({ onIn }: { onIn: (account: Account) => void }) {
   );
 }
 
+const MAX_BROCHURE = 1 << 20;
+
+function checkSize(file: File): string {
+  if (file.size === 0) {
+    return "The brochure is empty";
+  }
+  if (file.size > MAX_BROCHURE) {
+    return "The brochure must be at most 1 MiB";
+  }
+  return "";
+}
+
+function upload(id: string, file: File): Promise<Job> {
+  const body = new FormData();
+  body.append("file", file);
+  return api<Job>("/api/jobs/" + id + "/file", { method: "POST", body });
+}
+
 function Create({ onCreated, onError }: { onCreated: (job: Job) => void; onError: (message: string) => void }) {
   const [title, setTitle] = useState("");
   const [address, setAddress] = useState("");
@@ -171,20 +210,32 @@ function Create({ onCreated, onError }: { onCreated: (job: Job) => void; onError
       onError("Choose a brochure file");
       return;
     }
+    const tooBig = checkSize(file);
+    if (tooBig) {
+      onError(tooBig);
+      return;
+    }
+    let created: Job | null = null;
     try {
-      const job = await api<Job>("/api/jobs", {
+      created = await api<Job>("/api/jobs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title, address }),
       });
-      const body = new FormData();
-      body.append("file", file);
-      const saved = await api<Job>("/api/jobs/" + job.id + "/file", { method: "POST", body });
+      const saved = await upload(created.id, file);
       setTitle("");
       setAddress("");
       setFile(null);
       onCreated(saved);
     } catch (err) {
+      if (created) {
+        // The sheet exists even though the brochure was refused. Show it, so
+        // the brochure can be attached to it from the sheet.
+        setTitle("");
+        setAddress("");
+        setFile(null);
+        onCreated(created);
+      }
       onError(err instanceof Error ? err.message : "Could not create the sheet");
     }
   }
@@ -201,12 +252,7 @@ function Create({ onCreated, onError }: { onCreated: (job: Job) => void; onError
       </label>
       <label>
         Brochure
-        <input
-          type="file"
-          accept=".pdf,.txt,application/pdf,text/plain"
-          onChange={(event) => setFile(event.target.files?.[0] ?? null)}
-          required
-        />
+        <input type="file" onChange={(event) => setFile(event.target.files?.[0] ?? null)} required />
       </label>
       <button type="submit">Create sheet</button>
     </form>
@@ -232,6 +278,23 @@ function Sheet({
     }
   }
 
+  async function attach(file: File | undefined) {
+    if (!file) {
+      return;
+    }
+    const tooBig = checkSize(file);
+    if (tooBig) {
+      onError(tooBig);
+      return;
+    }
+    onError("");
+    try {
+      onChange(await upload(job.id, file));
+    } catch (err) {
+      onError(err instanceof Error ? err.message : "Could not attach the brochure");
+    }
+  }
+
   return (
     <article className="sheet">
       <h2>{job.title}</h2>
@@ -246,7 +309,13 @@ function Sheet({
           </li>
         ))}
       </ol>
-      {job.status === "draft" ? <button onClick={start}>Start</button> : null}
+      {job.status === "draft" && !job.filename ? (
+        <label>
+          Brochure
+          <input type="file" onChange={(event) => attach(event.target.files?.[0])} />
+        </label>
+      ) : null}
+      {job.status === "draft" && job.filename ? <button onClick={start}>Start</button> : null}
     </article>
   );
 }

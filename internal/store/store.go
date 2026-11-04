@@ -41,10 +41,41 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// OpenRetry keeps calling Open until it succeeds or timeout has passed. The API
+// and the worker both start while Postgres may still be coming up.
+func OpenRetry(dsn string, timeout time.Duration) (*Store, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		st, err := Open(dsn)
+		if err == nil {
+			return st, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, err
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// migrateLock serialises migrations: the API and the worker start together and
+// concurrent CREATE ... IF NOT EXISTS statements can still collide.
+const migrateLock = 727274
+
 func (s *Store) migrate() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_, err := s.db.ExecContext(ctx, schemaSQL)
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, migrateLock); err != nil {
+		return err
+	}
+	defer func() {
+		_, _ = conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock($1)`, migrateLock)
+	}()
+	_, err = conn.ExecContext(ctx, schemaSQL)
 	return err
 }
 
@@ -114,6 +145,24 @@ func (s *Store) ListJobs(ctx context.Context, userID string) ([]board.Job, error
 	return jobs, rows.Err()
 }
 
+// ListRunning returns every sheet that is waiting for the worker, oldest first.
+func (s *Store) ListRunning(ctx context.Context) ([]board.Job, error) {
+	rows, err := s.db.QueryContext(ctx, jobSelect+` WHERE status = 'running' ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var jobs []board.Job
+	for rows.Next() {
+		job, err := scanJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
 func (s *Store) CreateJob(ctx context.Context, job board.Job) error {
 	raw, err := json.Marshal(job.Checklist)
 	if err != nil {
@@ -143,6 +192,10 @@ func (s *Store) UpdateJob(ctx context.Context, job board.Job) error {
 		SET status = $1, error = $2, run_id = $3, filename = $4, checklist = $5, updated_at = $6
 		WHERE id = $7
 	`, job.Status, job.Error, job.RunID, job.Filename, string(raw), job.UpdatedAt.UTC(), job.ID)
+	if isUnique(err) {
+		// Only the one-running-sheet-per-account index can fail here.
+		return board.ErrDuplicate
+	}
 	if err != nil {
 		return err
 	}

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"path/filepath"
 	"time"
 )
 
@@ -44,6 +45,31 @@ func NewChecklist() []Step {
 		{Label: "Checking the address", State: "pending"},
 		{Label: "Publishing the sheet", State: "pending"},
 	}
+}
+
+// Advance marks the first pending step done. When no step is left pending
+// afterwards the job becomes successful. It reports whether the job is now
+// finished. Steps that are already done are never touched again.
+func (j *Job) Advance() bool {
+	for i := range j.Checklist {
+		if j.Checklist[i].State == "pending" {
+			j.Checklist[i].State = "done"
+			break
+		}
+	}
+	for _, step := range j.Checklist {
+		if step.State == "pending" {
+			return false
+		}
+	}
+	j.Status = "success"
+	j.Error = ""
+	return true
+}
+
+// BrochurePath is where the brochure bytes of a job live under dataDir.
+func BrochurePath(dataDir string, userID, jobID string) string {
+	return filepath.Join(dataDir, userID, jobID, "body")
 }
 
 func NewID() string {
